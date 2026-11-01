@@ -25,6 +25,10 @@ if (!authBaseUrl) {
     throw new Error('Set AUTH_BASE_URL to the Better Auth base URL before starting in production');
 }
 
+if (!process.env.DB_USER || !process.env.DB_PASS) {
+    throw new Error('Set DB_USER and DB_PASS before starting the API');
+}
+
 const authOrigin = new URL(authBaseUrl).origin;
 const jwks = createRemoteJWKSet(new URL('/api/auth/jwks', authOrigin));
 
@@ -34,7 +38,6 @@ app.use(cors({
     origin(origin, callback) {
         callback(null, !origin || allowedOrigins.has(origin));
     },
-    credentials: true,
 }));
 app.use(express.json({ limit: '10kb' }));
 app.use(rateLimit({
@@ -44,7 +47,7 @@ app.use(rateLimit({
     legacyHeaders: false,
 }));
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
     const authorization = req.get('authorization');
     const token = authorization?.startsWith('Bearer ')
         ? authorization.slice('Bearer '.length).trim()
@@ -55,24 +58,28 @@ function requireAuth(req, res, next) {
         return res.status(401).json({ message: 'A valid bearer token is required' });
     }
 
-    jwtVerify(token, jwks, {
-        issuer: authOrigin,
-        audience: authOrigin,
-    }).then(({ payload }) => {
-        if (typeof payload.sub !== 'string' || typeof payload.email !== 'string') {
+    try {
+        const { payload } = await jwtVerify(token, jwks, {
+            issuer: authOrigin,
+            audience: authOrigin,
+        });
+        const email = typeof payload.email === 'string'
+            ? payload.email.trim().toLowerCase()
+            : '';
+        if (typeof payload.sub !== 'string' || !payload.sub.trim() || !email) {
             res.setHeader('WWW-Authenticate', 'Bearer error="invalid_token"');
             return res.status(401).json({ message: 'The bearer token has invalid user claims' });
         }
 
         req.auth = {
-            id: payload.sub,
-            email: payload.email.trim().toLowerCase(),
+            id: payload.sub.trim(),
+            email,
             name: typeof payload.name === 'string' && payload.name.trim()
                 ? payload.name.trim()
-                : payload.email.trim(),
+                : email,
         };
         return next();
-    }).catch((err) => {
+    } catch (err) {
         if (err instanceof errors.JOSEError) {
             res.setHeader('WWW-Authenticate', 'Bearer error="invalid_token"');
             return res.status(401).json({ message: 'The bearer token is invalid or expired' });
@@ -80,7 +87,7 @@ function requireAuth(req, res, next) {
 
         console.error('Could not verify bearer token:', err);
         return res.status(503).json({ message: 'Authentication service is unavailable' });
-    });
+    }
 }
 
 const uri = `mongodb+srv://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASS)}@cluster0.fcgr75i.mongodb.net/`;
@@ -128,6 +135,19 @@ function redactBook(book) {
     };
 }
 
+function redactBorrowedBook(book) {
+    const {
+        Email,
+        UserName,
+        BorrowedByEmail,
+        BorrowedByName,
+        ...borrowedBook
+    } = book;
+    return borrowedBook;
+}
+
+const categories = new Set(['Fiction', 'Science', 'History', 'Kids', 'Novel', 'Others']);
+
 function validateBook(input) {
     const title = typeof input.Title === 'string' ? input.Title.trim() : '';
     const author = typeof input.Author === 'string' ? input.Author.trim() : '';
@@ -136,8 +156,6 @@ function validateBook(input) {
     const imageLink = typeof input['Image-link'] === 'string'
         ? input['Image-link'].trim()
         : '';
-    const categories = new Set(['Fiction', 'Science', 'History', 'Kids', 'Novel', 'Others']);
-
     if (!title || title.length > 200 || !author || author.length > 200) {
         return { error: 'Title and author are required and must be 200 characters or fewer' };
     }
@@ -200,7 +218,7 @@ app.get('/books/new-arrivals', async (req, res) => {
 app.get('/borrows', requireAuth, async (req, res) => {
     try {
         const borrowedBooks = await books.find({ BorrowedByEmail: req.auth.email }).toArray();
-        return res.json(borrowedBooks);
+        return res.json(borrowedBooks.map(redactBorrowedBook));
     } catch (err) {
         console.error('Failed to load borrowed books:', err);
         return res.status(500).json({ message: 'Failed to load borrowed books' });
@@ -252,18 +270,25 @@ app.delete('/books/:id', requireAuth, async (req, res) => {
     }
 
     try {
-        const result = await books.deleteOne({
+        const ownerFilter = {
             _id: new ObjectId(id),
             Email: { $regex: `^${escapeRegex(req.auth.email)}$`, $options: 'i' },
+        };
+        const ownedBook = await books.findOne(ownerFilter);
+
+        if (!ownedBook) {
+            return res.status(404).json({ message: 'Book not found or not owned by this user' });
+        }
+        if (ownedBook.BorrowedByEmail) {
+            return res.status(409).json({ message: 'This copy cannot be removed while it is borrowed' });
+        }
+
+        const result = await books.deleteOne({
+            ...ownerFilter,
             ...availableCopyFilter(),
         });
-
         if (result.deletedCount === 0) {
-            const existingBook = await books.findOne({ _id: new ObjectId(id) });
-            if (existingBook?.BorrowedByEmail) {
-                return res.status(409).json({ message: 'This copy cannot be removed while it is borrowed' });
-            }
-            return res.status(404).json({ message: 'Book not found or not owned by this user' });
+            return res.status(409).json({ message: 'The book availability changed; please retry' });
         }
 
         return res.status(200).json({ message: 'Book removed successfully' });
@@ -342,6 +367,22 @@ app.post('/borrows/:id/return', requireAuth, async (req, res) => {
         console.error('Failed to return book:', err);
         return res.status(500).json({ message: 'Failed to return book' });
     }
+})
+
+app.use((req, res) => {
+    return res.status(404).json({ message: 'Not found' });
+})
+
+app.use((err, req, res, next) => {
+    if (err.type === 'entity.too.large') {
+        return res.status(413).json({ message: 'Request body is too large' });
+    }
+    if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+        return res.status(400).json({ message: 'Request body must be valid JSON' });
+    }
+
+    console.error('Unhandled API error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
 })
 
 app.listen(PORT, () => {
