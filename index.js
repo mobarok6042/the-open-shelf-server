@@ -1,15 +1,89 @@
 import express from 'express';
 import 'dotenv/config'
 import cors from 'cors';
+import helmet from 'helmet';
+import { rateLimit } from 'express-rate-limit';
+import { createRemoteJWKSet, errors, jwtVerify } from 'jose';
 import { MongoClient, ObjectId } from 'mongodb';
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-//middle were
-app.use(cors())
-app.use(express.json())
+const isProduction = process.env.NODE_ENV === 'production';
+const configuredOrigins = process.env.CLIENT_ORIGINS
+    || (isProduction ? '' : 'http://localhost:3000');
+const allowedOrigins = new Set(
+    configuredOrigins.split(',').map((origin) => origin.trim()).filter(Boolean),
+);
 
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.fcgr75i.mongodb.net/`;
+if (allowedOrigins.size === 0) {
+    throw new Error('Set CLIENT_ORIGINS to the frontend origin(s) before starting in production');
+}
+
+const authBaseUrl = process.env.AUTH_BASE_URL
+    || (isProduction ? '' : 'http://localhost:3000');
+if (!authBaseUrl) {
+    throw new Error('Set AUTH_BASE_URL to the Better Auth base URL before starting in production');
+}
+
+const authOrigin = new URL(authBaseUrl).origin;
+const jwks = createRemoteJWKSet(new URL('/api/auth/jwks', authOrigin));
+
+app.disable('x-powered-by');
+app.use(helmet());
+app.use(cors({
+    origin(origin, callback) {
+        callback(null, !origin || allowedOrigins.has(origin));
+    },
+    credentials: true,
+}));
+app.use(express.json({ limit: '10kb' }));
+app.use(rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 100,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+}));
+
+function requireAuth(req, res, next) {
+    const authorization = req.get('authorization');
+    const token = authorization?.startsWith('Bearer ')
+        ? authorization.slice('Bearer '.length).trim()
+        : '';
+
+    if (!token) {
+        res.setHeader('WWW-Authenticate', 'Bearer');
+        return res.status(401).json({ message: 'A valid bearer token is required' });
+    }
+
+    jwtVerify(token, jwks, {
+        issuer: authOrigin,
+        audience: authOrigin,
+    }).then(({ payload }) => {
+        if (typeof payload.sub !== 'string' || typeof payload.email !== 'string') {
+            res.setHeader('WWW-Authenticate', 'Bearer error="invalid_token"');
+            return res.status(401).json({ message: 'The bearer token has invalid user claims' });
+        }
+
+        req.auth = {
+            id: payload.sub,
+            email: payload.email.trim().toLowerCase(),
+            name: typeof payload.name === 'string' && payload.name.trim()
+                ? payload.name.trim()
+                : payload.email.trim(),
+        };
+        return next();
+    }).catch((err) => {
+        if (err instanceof errors.JOSEError) {
+            res.setHeader('WWW-Authenticate', 'Bearer error="invalid_token"');
+            return res.status(401).json({ message: 'The bearer token is invalid or expired' });
+        }
+
+        console.error('Could not verify bearer token:', err);
+        return res.status(503).json({ message: 'Authentication service is unavailable' });
+    });
+}
+
+const uri = `mongodb+srv://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASS)}@cluster0.fcgr75i.mongodb.net/`;
 const client = new MongoClient(uri);
 
 
@@ -37,6 +111,62 @@ function availableCopyFilter() {
     };
 }
 
+function redactBook(book) {
+    const {
+        Email,
+        UserName,
+        BorrowedByEmail,
+        BorrowedByName,
+        BorrowedAt,
+        ...publicBook
+    } = book;
+    return {
+        ...publicBook,
+        BorrowedByEmail: typeof BorrowedByEmail === 'string' && BorrowedByEmail
+            ? 'borrowed'
+            : '',
+    };
+}
+
+function validateBook(input) {
+    const title = typeof input.Title === 'string' ? input.Title.trim() : '';
+    const author = typeof input.Author === 'string' ? input.Author.trim() : '';
+    const category = typeof input.Category === 'string' ? input.Category.trim() : '';
+    const details = typeof input.Details === 'string' ? input.Details.trim() : '';
+    const imageLink = typeof input['Image-link'] === 'string'
+        ? input['Image-link'].trim()
+        : '';
+    const categories = new Set(['Fiction', 'Science', 'History', 'Kids', 'Novel', 'Others']);
+
+    if (!title || title.length > 200 || !author || author.length > 200) {
+        return { error: 'Title and author are required and must be 200 characters or fewer' };
+    }
+    if (!categories.has(category)) {
+        return { error: 'A valid book category is required' };
+    }
+    if (details.length > 5000 || imageLink.length > 2048) {
+        return { error: 'Book details or image URL exceed the allowed length' };
+    }
+
+    try {
+        if (new URL(imageLink).protocol !== 'https:') {
+            return { error: 'The book cover must use an HTTPS URL' };
+        }
+    } catch {
+        return { error: 'A valid HTTPS book cover URL is required' };
+    }
+
+    return {
+        book: {
+            Title: title,
+            Author: author,
+            Category: category,
+            'Image-link': imageLink,
+            Details: details,
+        },
+    };
+}
+
 app.get('/', (req, res) => {
     res.send('hello world')
 })
@@ -45,7 +175,7 @@ app.get('/', (req, res) => {
 
 app.get('/books', async(req, res) => {
     try {
-        const allBooks = await books.find().toArray();
+        const allBooks = (await books.find().toArray()).map(redactBook);
         return res.send(allBooks);
     } catch (err) {
         console.error('Failed to load books:', err);
@@ -60,24 +190,16 @@ app.get('/books/new-arrivals', async (req, res) => {
             .sort({ _id: -1 })
             .limit(6)
             .toArray();
-        return res.json(latestBooks);
+        return res.json(latestBooks.map(redactBook));
     } catch (err) {
         console.error('Failed to load new arrivals:', err);
         return res.status(500).json({ message: 'Failed to load new arrivals' });
     }
 })
 
-app.get('/borrows', async (req, res) => {
-    const email = typeof req.query.email === 'string'
-        ? req.query.email.trim().toLowerCase()
-        : '';
-
-    if (!email) {
-        return res.status(400).json({ message: 'A borrower email is required' });
-    }
-
+app.get('/borrows', requireAuth, async (req, res) => {
     try {
-        const borrowedBooks = await books.find({ BorrowedByEmail: email }).toArray();
+        const borrowedBooks = await books.find({ BorrowedByEmail: req.auth.email }).toArray();
         return res.json(borrowedBooks);
     } catch (err) {
         console.error('Failed to load borrowed books:', err);
@@ -85,15 +207,36 @@ app.get('/borrows', async (req, res) => {
     }
 })
 
-app.post('/books', async (req, res) => {
+app.get('/my-books', requireAuth, async (req, res) => {
+    try {
+        const ownedBooks = await books.find({
+            Email: { $regex: `^${escapeRegex(req.auth.email)}$`, $options: 'i' },
+        }).toArray();
+        return res.json(ownedBooks.map(redactBook));
+    } catch (err) {
+        console.error('Failed to load your books:', err);
+        return res.status(500).json({ message: 'Failed to load your books' });
+    }
+})
+
+app.post('/books', requireAuth, async (req, res) => {
     const newBook = req.body;
 
     if (!newBook || typeof newBook !== 'object' || Array.isArray(newBook)) {
         return res.status(400).json({ message: 'A book object is required' });
     }
 
+    const validated = validateBook(newBook);
+    if (validated.error) {
+        return res.status(400).json({ message: validated.error });
+    }
+
     try {
-        const result = await books.insertOne(newBook);
+        const result = await books.insertOne({
+            ...validated.book,
+            UserName: req.auth.name,
+            Email: req.auth.email,
+        });
         res.status(201).json({ insertedId: result.insertedId });
     } catch (err) {
         console.error('Failed to add book:', err);
@@ -101,22 +244,17 @@ app.post('/books', async (req, res) => {
     }
 })
 
-app.delete('/books/:id', async (req, res) => {
+app.delete('/books/:id', requireAuth, async (req, res) => {
     const { id } = req.params;
-    const email = typeof req.query.email === 'string' ? req.query.email.trim() : '';
 
     if (!ObjectId.isValid(id)) {
         return res.status(400).json({ message: 'A valid book ID is required' });
     }
 
-    if (!email) {
-        return res.status(400).json({ message: 'An owner email is required' });
-    }
-
     try {
         const result = await books.deleteOne({
             _id: new ObjectId(id),
-            Email: { $regex: `^${escapeRegex(email)}$`, $options: 'i' },
+            Email: { $regex: `^${escapeRegex(req.auth.email)}$`, $options: 'i' },
             ...availableCopyFilter(),
         });
 
@@ -135,20 +273,11 @@ app.delete('/books/:id', async (req, res) => {
     }
 })
 
-app.post('/books/:id/borrow', async (req, res) => {
+app.post('/books/:id/borrow', requireAuth, async (req, res) => {
     const { id } = req.params;
-    const email = typeof req.body?.email === 'string'
-        ? req.body.email.trim().toLowerCase()
-        : '';
-    const name = typeof req.body?.name === 'string'
-        ? req.body.name.trim()
-        : '';
 
     if (!ObjectId.isValid(id)) {
         return res.status(400).json({ message: 'A valid book ID is required' });
-    }
-    if (!email || !name) {
-        return res.status(400).json({ message: 'Borrower name and email are required' });
     }
 
     try {
@@ -167,8 +296,8 @@ app.post('/books/:id/borrow', async (req, res) => {
             },
             {
                 $set: {
-                    BorrowedByEmail: email,
-                    BorrowedByName: name,
+                    BorrowedByEmail: req.auth.email,
+                    BorrowedByName: req.auth.name,
                     BorrowedAt: new Date().toISOString(),
                 },
             },
@@ -186,22 +315,15 @@ app.post('/books/:id/borrow', async (req, res) => {
     }
 })
 
-app.post('/borrows/:id/return', async (req, res) => {
+app.post('/borrows/:id/return', requireAuth, async (req, res) => {
     const { id } = req.params;
-    const email = typeof req.body?.email === 'string'
-        ? req.body.email.trim().toLowerCase()
-        : '';
 
     if (!ObjectId.isValid(id)) {
         return res.status(400).json({ message: 'A valid book ID is required' });
     }
-    if (!email) {
-        return res.status(400).json({ message: 'A borrower email is required' });
-    }
-
     try {
         const result = await books.updateOne(
-            { _id: new ObjectId(id), BorrowedByEmail: email },
+            { _id: new ObjectId(id), BorrowedByEmail: req.auth.email },
             {
                 $unset: {
                     BorrowedByEmail: '',
