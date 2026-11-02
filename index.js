@@ -8,21 +8,18 @@ import { MongoClient, ObjectId } from 'mongodb';
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const isProduction = process.env.NODE_ENV === 'production';
-const configuredOrigins = process.env.CLIENT_ORIGINS
-    || (isProduction ? '' : 'http://localhost:3000');
+const configuredOrigins = process.env.CLIENT_ORIGINS || '';
 const allowedOrigins = new Set(
     configuredOrigins.split(',').map((origin) => origin.trim()).filter(Boolean),
 );
 
 if (allowedOrigins.size === 0) {
-    throw new Error('Set CLIENT_ORIGINS to the frontend origin(s) before starting in production');
+    throw new Error('Set CLIENT_ORIGINS to the allowed frontend origin(s) before starting the API');
 }
 
-const authBaseUrl = process.env.AUTH_BASE_URL
-    || (isProduction ? '' : 'http://localhost:3000');
+const authBaseUrl = process.env.AUTH_BASE_URL;
 if (!authBaseUrl) {
-    throw new Error('Set AUTH_BASE_URL to the Better Auth base URL before starting in production');
+    throw new Error('Set AUTH_BASE_URL to the Better Auth base URL before starting the API');
 }
 
 if (!process.env.DB_USER || !process.env.DB_PASS) {
