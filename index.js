@@ -5,7 +5,7 @@ import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import { createRemoteJWKSet, errors, jwtVerify } from 'jose';
 import { MongoClient, ObjectId } from 'mongodb';
-const cors = require("cors");
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -383,8 +383,6 @@ app.use((err, req, res, next) => {
     return res.status(500).json({ message: 'Internal server error' });
 })
 
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`)
-})
+
 
 export default app
