@@ -260,6 +260,53 @@ app.post('/books', requireAuth, async (req, res) => {
     }
 })
 
+app.put('/books/:id', requireAuth, async (req, res) => {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: 'A valid book ID is required' });
+    }
+
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+        return res.status(400).json({ message: 'A book object is required' });
+    }
+
+    const validated = validateBook(req.body);
+    if (validated.error) {
+        return res.status(400).json({ message: validated.error });
+    }
+
+    const ownerFilter = {
+        _id: new ObjectId(id),
+        Email: { $regex: `^${escapeRegex(req.auth.email)}$`, $options: 'i' },
+    };
+
+    try {
+        const ownedBook = await books.findOne(ownerFilter);
+
+        if (!ownedBook) {
+            return res.status(404).json({ message: 'Book not found or not owned by this user' });
+        }
+        if (ownedBook.BorrowedByEmail) {
+            return res.status(409).json({ message: 'This book cannot be edited while it is borrowed' });
+        }
+
+        const result = await books.updateOne(
+            { ...ownerFilter, ...availableCopyFilter() },
+            { $set: validated.book },
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(409).json({ message: 'The book availability changed; please retry' });
+        }
+
+        return res.status(200).json({ message: 'Book updated successfully' });
+    } catch (err) {
+        console.error('Failed to update book:', err);
+        return res.status(500).json({ message: 'Failed to update book' });
+    }
+})
+
 app.delete('/books/:id', requireAuth, async (req, res) => {
     const { id } = req.params;
 
